@@ -397,6 +397,17 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
+        if tail_boundary and self.use_eagle:
+            # Eagle matches one hash unit past the candidate and drops it, so
+            # materialize the state where the consumer can actually resume.
+            tail_boundary = max(tail_boundary - self.hash_block_size, 0)
+        junction = request.shared_prefix_boundary
+        if self.mamba_partial_cache_hit and self.use_eagle:
+            junction_stop = junction // self.hash_block_size * self.hash_block_size
+            if junction_stop > request.num_prompt_tokens:
+                junction_stop = 0
+        else:
+            junction_stop = start + (junction - start) // block_size * block_size
         stops = (
             # Resumed mid-block (fine-grained partial hash hit): re-align to
             # the block grid before running on, so the crossed boundary's
@@ -411,12 +422,9 @@ class Scheduler(SchedulerInterface):
             tail_boundary
             if last_cache_position < tail_boundary < request.num_prompt_tokens
             else 0,
-            # Marconi shared-prefix junction, block-floored (a sub-block
-            # junction's state is not separately cacheable): cache its state
-            # so sibling requests sharing the prefix can reuse it.
-            start + (request.shared_prefix_boundary - start) // block_size * block_size
-            if start < request.shared_prefix_boundary < end
-            else 0,
+            # Under Eagle the sibling resumes one hash unit below the full
+            # attention junction, so preserve that hash-grid checkpoint.
+            junction_stop if start < request.shared_prefix_boundary < end else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)

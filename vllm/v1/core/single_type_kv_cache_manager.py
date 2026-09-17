@@ -1660,7 +1660,16 @@ class MambaManager(SingleTypeKVCacheManager):
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
+        if self.use_eagle:
+            latest_prompt_hash_boundary = max(
+                latest_prompt_hash_boundary - hash_block_size, 0
+            )
+        block_grid_resume_point = (
+            self.use_eagle
+            and num_tokens <= request.num_prompt_tokens
+            and (num_tokens + hash_block_size) % self.block_size == 0
+        )
+        if num_tokens != latest_prompt_hash_boundary and not block_grid_resume_point:
             return None
 
         block_idx = num_tokens // self.block_size
