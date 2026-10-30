@@ -992,13 +992,18 @@ def test_eagle_sibling_reuses_mid_block_shared_prefix():
 
     def prefill(request):
         blocks, computed, junction = manager.get_computed_blocks(request)
-        request.num_computed_tokens = computed
         request.shared_prefix_boundary = junction
         first = True
         while request.num_computed_tokens < request.num_prompt_tokens:
-            remaining = request.num_prompt_tokens - request.num_computed_tokens
+            local_hit = computed if first else 0
+            remaining = (
+                request.num_prompt_tokens - request.num_computed_tokens - local_hit
+            )
             scheduled = Scheduler._mamba_block_aligned_split(
-                scheduler, request, remaining
+                scheduler,
+                request,
+                remaining,
+                num_new_local_computed_tokens=local_hit,
             )
             assert scheduled > 0
             allocated = (
@@ -1008,7 +1013,7 @@ def test_eagle_sibling_reuses_mid_block_shared_prefix():
             )
             assert allocated is not None
             first = False
-            request.num_computed_tokens += scheduled
+            request.num_computed_tokens += local_hit + scheduled
             manager.new_step_starts()
         return computed, junction
 
@@ -1022,5 +1027,9 @@ def test_eagle_sibling_reuses_mid_block_shared_prefix():
     assert detector_junction == 20
 
     sibling = make_request("sibling", shared + [10] * 16, hash_block_size, sha256)
+    _, per_group_hits = manager.coordinator.find_longest_cache_hit_per_group(
+        sibling.block_hashes, sibling.num_tokens - 1
+    )
+    assert per_group_hits == (20, 20)
     _, sibling_hit, _ = manager.get_computed_blocks(sibling)
     assert sibling_hit == 20
