@@ -115,6 +115,7 @@ class SingleTypeKVCacheManager(ABC):
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        self._partial_hash_progress: dict[str, int] = {}
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -490,6 +491,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self._partial_hash_progress.pop(request_id, None)
         return req_blocks
 
     def free(self, request_id: str) -> None:
@@ -756,41 +758,69 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         num_tokens: int,
         retention_interval: int | None = None,
     ) -> None:
+        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
-        self._cache_partial_tail_block(request, num_tokens)
+        self._cache_partial_blocks(request, num_tokens, num_cached_blocks)
 
-    def _cache_partial_tail_block(
+    def _cache_partial_blocks(
         self,
         request: Request,
         num_tokens: int,
+        num_cached_blocks: int,
     ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
-
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
-        """
+        """Expose computed full-attention KV at every fine hash boundary."""
         hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
-            return
-        if boundary_tokens % self.block_size == 0:
+        boundary_tokens = (
+            min(request.num_prompt_tokens, num_tokens)
+            // hash_block_size
+            * hash_block_size
+        )
+        if boundary_tokens == 0:
             return
 
         blocks = self.req_to_blocks[request.request_id]
-        block_idx = boundary_tokens // self.block_size
-        if block_idx >= len(blocks):
-            return
-        self.block_pool.cache_partial_block(
-            request=request,
-            block=blocks[block_idx],
-            num_tokens=boundary_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
-        )
+        num_full_blocks = boundary_tokens // self.block_size
+
+        # Full-block promotion replaces the block's hash metadata, so restore
+        # its interior aliases after the primary full-block hash is installed.
+        for block_idx in range(num_cached_blocks, num_full_blocks):
+            block_start = block_idx * self.block_size
+            block_end = block_start + self.block_size
+            for boundary in range(
+                block_start + hash_block_size, block_end, hash_block_size
+            ):
+                self.block_pool.cache_partial_block(
+                    request=request,
+                    block=blocks[block_idx],
+                    num_tokens=boundary,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                    preserve_prior_hashes=True,
+                )
+
+        if boundary_tokens % self.block_size:
+            block_idx = boundary_tokens // self.block_size
+            previous = self._partial_hash_progress.get(request.request_id, 0)
+            block_start = block_idx * self.block_size
+            if previous // self.block_size != block_idx:
+                previous = block_start
+            for boundary in range(
+                previous + hash_block_size,
+                boundary_tokens + 1,
+                hash_block_size,
+            ):
+                self.block_pool.cache_partial_block(
+                    request=request,
+                    block=blocks[block_idx],
+                    num_tokens=boundary,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                    preserve_prior_hashes=True,
+                )
+        self._partial_hash_progress[request.request_id] = boundary_tokens
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -1660,14 +1690,38 @@ class MambaManager(SingleTypeKVCacheManager):
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
+        if self.use_eagle:
+            latest_prompt_hash_boundary = max(
+                latest_prompt_hash_boundary - hash_block_size, 0
+            )
+        block_grid_resume_point = (
+            self.use_eagle
+            and num_tokens <= request.num_prompt_tokens
+            and (num_tokens + hash_block_size) % self.block_size == 0
+        )
+        junction_checkpoint = (
+            request.shared_prefix_boundary // hash_block_size * hash_block_size
+        )
+        shared_prefix_resume_point = (
+            self.use_eagle
+            and 0 < junction_checkpoint <= request.num_prompt_tokens
+            and num_tokens == junction_checkpoint
+        )
+        if (
+            num_tokens != latest_prompt_hash_boundary
+            and not block_grid_resume_point
+            and not shared_prefix_resume_point
+        ):
             return None
 
-        block_idx = num_tokens // self.block_size
+        logical_block_idx = num_tokens // self.block_size
         blocks = self.req_to_blocks[request.request_id]
-        if block_idx >= len(blocks):
+        state_block_idx = logical_block_idx
+        if state_block_idx >= len(blocks) or blocks[state_block_idx].is_null:
+            state_block_idx = len(blocks) - 1 - self.num_speculative_blocks
+        if not 0 <= state_block_idx < len(blocks):
             return None
-        source_block = blocks[block_idx]
+        source_block = blocks[state_block_idx]
         if source_block.is_null:
             return None
 
@@ -1679,8 +1733,11 @@ class MambaManager(SingleTypeKVCacheManager):
             block_size=self.block_size,
         )
         if partial_hash is not None:
-            self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
-            self.num_cached_block[request.request_id] = block_idx
+            self._partial_hit_reqs[request.request_id] = (
+                state_block_idx,
+                source_block,
+            )
+            self.num_cached_block[request.request_id] = logical_block_idx
         return partial_hash
 
 

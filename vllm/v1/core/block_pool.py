@@ -449,6 +449,7 @@ class BlockPool:
         num_tokens: int,
         kv_cache_group_id: int,
         block_size: int,
+        preserve_prior_hashes: bool = False,
     ) -> BlockHashWithGroupId | None:
         """Register a partial prefix-cache entry for an existing block.
 
@@ -476,6 +477,10 @@ class BlockPool:
                 entry hash itself is always the prefix-chain hash at
                 ``num_tokens``; ``block_size`` is used to assert that the
                 entry is partial within the owning cache block.
+            preserve_prior_hashes: Keep earlier partial entries that point to
+                the same append-only cache block. Full attention uses this to
+                expose fine-grained prefix boundaries; recurrent-state blocks
+                must leave it disabled because they represent one position.
 
         Returns:
             The hash key with group ID if a partial entry can be registered;
@@ -499,6 +504,7 @@ class BlockPool:
         )
         if (
             not already_cached
+            and not preserve_prior_hashes
             and block.block_hash is not None
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size

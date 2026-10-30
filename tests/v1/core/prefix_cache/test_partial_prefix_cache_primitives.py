@@ -233,6 +233,40 @@ def test_partial_block_replacement_emits_remove_then_store_events():
     assert pool.get_cached_block(partial_hash_10, [kv_cache_group_id]) == [blocks[1]]
 
 
+def test_partial_block_can_preserve_earlier_aliases():
+    hash_block_size = 2
+    block_size = 6
+    kv_cache_group_id = 0
+    req = make_request("0", [0, 0, 1, 1, 2, 2, 3, 3, 4, 4], hash_block_size, sha256)
+    pool = BlockPool(
+        num_gpu_blocks=3,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    blocks = pool.get_new_blocks(2)
+
+    partial_hash_8 = boundary_hash(req, hash_block_size, 8)
+    partial_hash_10 = boundary_hash(req, hash_block_size, 10)
+    assert pool.cache_partial_block(
+        request=req,
+        block=blocks[1],
+        num_tokens=8,
+        kv_cache_group_id=kv_cache_group_id,
+        block_size=block_size,
+    )
+    assert pool.cache_partial_block(
+        request=req,
+        block=blocks[1],
+        num_tokens=10,
+        kv_cache_group_id=kv_cache_group_id,
+        block_size=block_size,
+        preserve_prior_hashes=True,
+    )
+
+    assert pool.get_cached_block(partial_hash_8, [kv_cache_group_id]) == [blocks[1]]
+    assert pool.get_cached_block(partial_hash_10, [kv_cache_group_id]) == [blocks[1]]
+
+
 def test_later_request_hits_cached_partial_tail():
     hash_block_size = 2
     block_size = 6

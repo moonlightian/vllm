@@ -814,3 +814,222 @@ def test_hybrid_partial_hit_with_eagle_stays_within_group_blocks():
         len(group) * block_size >= num_computed for group in computed_blocks.blocks
     )
     assert manager.allocate_slots(req1, 4, num_computed, computed_blocks) is not None
+
+
+def test_eagle_shared_prefix_junction_uses_hash_grid():
+    """MTP/EAGLE must materialize the state where the sibling resumes."""
+    block_size = 512
+    hash_block_size = 32
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        use_eagle=True,
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=True,
+    )
+    req = make_request("owner", [0] * 10000, hash_block_size, sha256)
+    req.num_computed_tokens = 0
+    req.shared_prefix_boundary = 2000
+
+    # The consumer resumes one hash unit below the FA junction. The producer
+    # must stop there rather than rounding all the way down to block 1536.
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            self=mock, request=req, num_new_tokens=8192
+        )
+        == 1984
+    )
+
+
+def test_eagle_mamba_caches_block_grid_resume_point():
+    """A suffix-bearing producer caches the MTP resume checkpoint."""
+    hash_block_size = 1
+    block_size = 4
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    owner = make_request("owner", [7] * 12, hash_block_size, sha256)
+    computed, num_computed, _ = manager.get_computed_blocks(owner)
+    done = 0
+    for stop in (3, 4, 7, 8, 12):
+        allocated = (
+            manager.allocate_slots(owner, stop - done, num_computed, computed)
+            if done == 0
+            else manager.allocate_slots(owner, stop - done)
+        )
+        assert allocated is not None
+        done = stop
+        owner.num_computed_tokens = done
+        manager.new_step_starts()
+
+    follower = make_request("follower", [7] * 8 + [9] * 2, hash_block_size, sha256)
+    _, hit, _ = manager.get_computed_blocks(follower)
+    assert hit == 7, f"expected the EAGLE resume checkpoint at 7, got {hit}"
+
+
+def test_eagle_mamba_caches_shared_prefix_junction():
+    """A scheduler-materialized non-grid junction must be published."""
+    hash_block_size = 16
+    block_size = 816
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=16384,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    owner = make_request("owner", [7] * 10586, hash_block_size, sha256)
+    owner.shared_prefix_boundary = 10414
+    junction_checkpoint = 10400
+
+    computed, num_computed, _ = manager.get_computed_blocks(owner)
+    assert (
+        manager.allocate_slots(owner, junction_checkpoint, num_computed, computed)
+        is not None
+    )
+    owner.num_computed_tokens = junction_checkpoint
+    manager.new_step_starts()
+    assert manager.allocate_slots(owner, hash_block_size) is not None
+
+    junction_hash = owner.block_hashes[junction_checkpoint // hash_block_size - 1]
+    cached = manager.block_pool.get_cached_block(junction_hash, kv_cache_group_ids=[1])
+    assert cached is not None
+    assert cached[0].block_hash_num_tokens == junction_checkpoint
+
+
+def test_eagle_sibling_reuses_mid_block_shared_prefix():
+    """A detector request materializes the fine junction for later siblings."""
+    hash_block_size = 4
+    block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=4096,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        use_eagle=True,
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=True,
+    )
+
+    def prefill(request):
+        blocks, computed, junction = manager.get_computed_blocks(request)
+        request.shared_prefix_boundary = junction
+        first = True
+        while request.num_computed_tokens < request.num_prompt_tokens:
+            local_hit = computed if first else 0
+            remaining = (
+                request.num_prompt_tokens - request.num_computed_tokens - local_hit
+            )
+            scheduled = Scheduler._mamba_block_aligned_split(
+                scheduler,
+                request,
+                remaining,
+                num_new_local_computed_tokens=local_hit,
+            )
+            assert scheduled > 0
+            allocated = (
+                manager.allocate_slots(request, scheduled, computed, blocks)
+                if first
+                else manager.allocate_slots(request, scheduled)
+            )
+            assert allocated is not None
+            first = False
+            request.num_computed_tokens += local_hit + scheduled
+            manager.new_step_starts()
+        return computed, junction
+
+    shared = [7] * 24
+    owner = make_request("owner", shared + [8] * 16, hash_block_size, sha256)
+    assert prefill(owner) == (0, 0)
+
+    detector = make_request("detector", shared + [9] * 16, hash_block_size, sha256)
+    detector_hit, detector_junction = prefill(detector)
+    assert detector_hit == 16
+    assert detector_junction == 20
+
+    sibling = make_request("sibling", shared + [10] * 16, hash_block_size, sha256)
+    _, per_group_hits = manager.coordinator.find_longest_cache_hit_per_group(
+        sibling.block_hashes, sibling.num_tokens - 1
+    )
+    assert per_group_hits == (20, 20)
+    _, sibling_hit, _ = manager.get_computed_blocks(sibling)
+    assert sibling_hit == 20
