@@ -832,9 +832,12 @@ def test_eagle_shared_prefix_junction_uses_hash_grid():
 
     # The consumer resumes one hash unit below the FA junction. The producer
     # must stop there rather than rounding all the way down to block 1536.
-    assert Scheduler._mamba_block_aligned_split(
-        self=mock, request=req, num_new_tokens=8192
-    ) == 1984
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            self=mock, request=req, num_new_tokens=8192
+        )
+        == 1984
+    )
 
 
 def test_eagle_mamba_caches_block_grid_resume_point():
@@ -932,20 +935,14 @@ def test_eagle_mamba_caches_shared_prefix_junction():
 
     computed, num_computed, _ = manager.get_computed_blocks(owner)
     assert (
-        manager.allocate_slots(
-            owner, junction_checkpoint, num_computed, computed
-        )
+        manager.allocate_slots(owner, junction_checkpoint, num_computed, computed)
         is not None
     )
     owner.num_computed_tokens = junction_checkpoint
     manager.new_step_starts()
     assert manager.allocate_slots(owner, hash_block_size) is not None
 
-    junction_hash = owner.block_hashes[
-        junction_checkpoint // hash_block_size - 1
-    ]
-    cached = manager.block_pool.get_cached_block(
-        junction_hash, kv_cache_group_ids=[1]
-    )
+    junction_hash = owner.block_hashes[junction_checkpoint // hash_block_size - 1]
+    cached = manager.block_pool.get_cached_block(junction_hash, kv_cache_group_ids=[1])
     assert cached is not None
     assert cached[0].block_hash_num_tokens == junction_checkpoint
