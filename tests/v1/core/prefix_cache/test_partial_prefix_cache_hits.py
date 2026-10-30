@@ -946,3 +946,81 @@ def test_eagle_mamba_caches_shared_prefix_junction():
     cached = manager.block_pool.get_cached_block(junction_hash, kv_cache_group_ids=[1])
     assert cached is not None
     assert cached[0].block_hash_num_tokens == junction_checkpoint
+
+
+def test_eagle_sibling_reuses_mid_block_shared_prefix():
+    """A detector request materializes the fine junction for later siblings."""
+    hash_block_size = 4
+    block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=4096,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        use_eagle=True,
+        hash_block_size=hash_block_size,
+        mamba_partial_cache_hit=True,
+    )
+
+    def prefill(request):
+        blocks, computed, junction = manager.get_computed_blocks(request)
+        request.num_computed_tokens = computed
+        request.shared_prefix_boundary = junction
+        first = True
+        while request.num_computed_tokens < request.num_prompt_tokens:
+            remaining = request.num_prompt_tokens - request.num_computed_tokens
+            scheduled = Scheduler._mamba_block_aligned_split(
+                scheduler, request, remaining
+            )
+            assert scheduled > 0
+            allocated = (
+                manager.allocate_slots(request, scheduled, computed, blocks)
+                if first
+                else manager.allocate_slots(request, scheduled)
+            )
+            assert allocated is not None
+            first = False
+            request.num_computed_tokens += scheduled
+            manager.new_step_starts()
+        return computed, junction
+
+    shared = [7] * 24
+    owner = make_request("owner", shared + [8] * 16, hash_block_size, sha256)
+    assert prefill(owner) == (0, 0)
+
+    detector = make_request("detector", shared + [9] * 16, hash_block_size, sha256)
+    detector_hit, detector_junction = prefill(detector)
+    assert detector_hit == 16
+    assert detector_junction == 20
+
+    sibling = make_request("sibling", shared + [10] * 16, hash_block_size, sha256)
+    _, sibling_hit, _ = manager.get_computed_blocks(sibling)
+    assert sibling_hit == 20
