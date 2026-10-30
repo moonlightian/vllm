@@ -889,3 +889,63 @@ def test_eagle_mamba_caches_block_grid_resume_point():
     follower = make_request("follower", [7] * 8 + [9] * 2, hash_block_size, sha256)
     _, hit, _ = manager.get_computed_blocks(follower)
     assert hit == 7, f"expected the EAGLE resume checkpoint at 7, got {hit}"
+
+
+def test_eagle_mamba_caches_shared_prefix_junction():
+    """A scheduler-materialized non-grid junction must be published."""
+    hash_block_size = 16
+    block_size = 816
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=16384,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    owner = make_request("owner", [7] * 10586, hash_block_size, sha256)
+    owner.shared_prefix_boundary = 10414
+    junction_checkpoint = 10400
+
+    computed, num_computed, _ = manager.get_computed_blocks(owner)
+    assert (
+        manager.allocate_slots(
+            owner, junction_checkpoint, num_computed, computed
+        )
+        is not None
+    )
+    owner.num_computed_tokens = junction_checkpoint
+    manager.new_step_starts()
+    assert manager.allocate_slots(owner, hash_block_size) is not None
+
+    junction_hash = owner.block_hashes[
+        junction_checkpoint // hash_block_size - 1
+    ]
+    cached = manager.block_pool.get_cached_block(
+        junction_hash, kv_cache_group_ids=[1]
+    )
+    assert cached is not None
+    assert cached[0].block_hash_num_tokens == junction_checkpoint
